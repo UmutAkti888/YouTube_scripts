@@ -1,0 +1,455 @@
+#!/usr/bin/env python3
+"""
+YouTube Description Transcript Extractor
+A script to extract transcripts from YouTube video descriptions.
+"""
+
+import sys
+import re
+import json
+import requests
+from urllib.parse import urlparse, parse_qs
+from bs4 import BeautifulSoup
+import time
+
+class YouTubeDescriptionExtractor:
+    def __init__(self, api_key=None):
+        """
+        Initialize the extractor.
+        
+        Args:
+            api_key (str): YouTube Data API v3 key (optional, for API method)
+        """
+        self.api_key = api_key
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        })
+
+    def extract_video_id(self, url):
+        """Extract video ID from various YouTube URL formats."""
+        patterns = [
+            r'(?:v=|\/)([0-9A-Za-z_-]{11}).*',
+            r'(?:embed\/)([0-9A-Za-z_-]{11})',
+            r'(?:v\/|youtu\.be\/)([0-9A-Za-z_-]{11})'
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, url)
+            if match:
+                return match.group(1)
+        
+        # If URL doesn't match patterns, assume it's already a video ID
+        if len(url) == 11 and re.match(r'^[0-9A-Za-z_-]+$', url):
+            return url
+        
+        return None
+
+    def get_description_via_api(self, video_id):
+        """
+        Get video description using YouTube Data API v3.
+        Requires API key from Google Cloud Console.
+        """
+        if not self.api_key:
+            raise ValueError("YouTube Data API key required for API method")
+        
+        url = "https://www.googleapis.com/youtube/v3/videos"
+        params = {
+            'part': 'snippet',
+            'id': video_id,
+            'key': self.api_key
+        }
+        
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if not data.get('items'):
+            raise ValueError(f"Video not found: {video_id}")
+        
+        return data['items'][0]['snippet']['description']
+
+    def get_description_via_scraping(self, video_id):
+        """
+        Get video description by scraping YouTube page.
+        Uses multiple methods to extract the full description.
+        """
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        
+        try:
+            response = self.session.get(url)
+            response.raise_for_status()
+            
+            html_content = response.text
+            
+            # Method 1: Look for ytInitialData
+            description = self._extract_from_initial_data(html_content)
+            if description and len(description) > 50:  # Make sure it's not just a snippet
+                return description
+            
+            # Method 2: Look for ytInitialPlayerResponse
+            description = self._extract_from_player_response(html_content)
+            if description and len(description) > 50:
+                return description
+            
+            # Method 3: Look for specific JSON patterns
+            description = self._extract_from_json_patterns(html_content)
+            if description and len(description) > 50:
+                return description
+            
+            # Method 4: Parse with BeautifulSoup and look for meta tags (fallback)
+            soup = BeautifulSoup(html_content, 'html.parser')
+            description_meta = soup.find('meta', {'name': 'description'})
+            if description_meta:
+                meta_desc = description_meta.get('content', '')
+                if meta_desc:
+                    print(f"Warning: Only found meta description (may be truncated): {len(meta_desc)} characters")
+                    return meta_desc
+            
+            raise ValueError("Could not extract full description from page")
+            
+        except requests.RequestException as e:
+            raise ValueError(f"Failed to fetch page: {str(e)}")
+    
+    def _extract_from_initial_data(self, html_content):
+        """Extract description from ytInitialData."""
+        patterns = [
+            r'var ytInitialData = ({.+?});',
+            r'window\["ytInitialData"\] = ({.+?});',
+            r'ytInitialData"?:\s*({.+?})(?:,|;|})'
+        ]
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, html_content, re.DOTALL)
+            for match in matches:
+                try:
+                    data = json.loads(match)
+                    description = self._extract_description_from_data(data)
+                    if description:
+                        return description
+                except json.JSONDecodeError:
+                    continue
+        return None
+    
+    def _extract_from_player_response(self, html_content):
+        """Extract description from ytInitialPlayerResponse."""
+        patterns = [
+            r'var ytInitialPlayerResponse = ({.+?});',
+            r'ytInitialPlayerResponse"?:\s*({.+?})(?:,|;|})'
+        ]
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, html_content, re.DOTALL)
+            for match in matches:
+                try:
+                    data = json.loads(match)
+                    # Look for description in player response
+                    video_details = data.get('videoDetails', {})
+                    if 'shortDescription' in video_details:
+                        return video_details['shortDescription']
+                except json.JSONDecodeError:
+                    continue
+        return None
+    
+    def _extract_from_json_patterns(self, html_content):
+        """Extract description using various JSON patterns in the HTML."""
+        # Look for description in any JSON-like structure
+        description_patterns = [
+            r'"description":\s*{"simpleText":"([^"]+)"',
+            r'"description":\s*"([^"]+)"',
+            r'"shortDescription":\s*"([^"]+)"'
+        ]
+        
+        for pattern in description_patterns:
+            matches = re.findall(pattern, html_content, re.DOTALL)
+            for match in matches:
+                # Decode JSON escape sequences
+                try:
+                    description = match.encode().decode('unicode_escape')
+                    if len(description) > 50:  # Make sure it's substantial
+                        return description
+                except:
+                    continue
+        
+        return None
+
+    def _extract_description_from_data(self, data):
+        """Extract description from YouTube's JSON data structure."""
+        try:
+            # Method 1: Look in contents -> twoColumnWatchNextResults
+            contents = data.get('contents', {})
+            two_column = contents.get('twoColumnWatchNextResults', {})
+            results = two_column.get('results', {})
+            results_contents = results.get('results', {}).get('contents', [])
+            
+            for content in results_contents:
+                if 'videoSecondaryInfoRenderer' in content:
+                    secondary = content['videoSecondaryInfoRenderer']
+                    description_obj = secondary.get('description', {})
+                    
+                    # Try different description formats
+                    if 'simpleText' in description_obj:
+                        return description_obj['simpleText']
+                    elif 'runs' in description_obj:
+                        full_text = ''
+                        for run in description_obj['runs']:
+                            if 'text' in run:
+                                full_text += run['text']
+                        if full_text:
+                            return full_text
+            
+            # Method 2: Look in metadata
+            metadata = data.get('metadata', {})
+            if 'videoMetadataRenderer' in metadata:
+                video_meta = metadata['videoMetadataRenderer']
+                if 'description' in video_meta:
+                    desc_obj = video_meta['description']
+                    if 'simpleText' in desc_obj:
+                        return desc_obj['simpleText']
+                    elif 'runs' in desc_obj:
+                        return ''.join([run.get('text', '') for run in desc_obj['runs']])
+            
+            # Method 3: Look for any description field recursively
+            description = self._find_description_recursive(data)
+            if description:
+                return description
+            
+            return None
+        except (KeyError, TypeError) as e:
+            print(f"Debug: Error parsing JSON structure: {e}")
+            return None
+    
+    def _find_description_recursive(self, obj, depth=0, max_depth=10):
+        """Recursively search for description fields in the JSON structure."""
+        if depth > max_depth:
+            return None
+        
+        if isinstance(obj, dict):
+            # Look for description keys
+            for key in ['description', 'shortDescription', 'longDescription']:
+                if key in obj:
+                    desc_obj = obj[key]
+                    if isinstance(desc_obj, str):
+                        return desc_obj
+                    elif isinstance(desc_obj, dict):
+                        if 'simpleText' in desc_obj:
+                            return desc_obj['simpleText']
+                        elif 'runs' in desc_obj:
+                            return ''.join([run.get('text', '') for run in desc_obj['runs'] if isinstance(run, dict)])
+            
+            # Recursively search in nested objects
+            for value in obj.values():
+                result = self._find_description_recursive(value, depth + 1, max_depth)
+                if result and len(result) > 100:  # Only return substantial descriptions
+                    return result
+        
+        elif isinstance(obj, list):
+            for item in obj:
+                result = self._find_description_recursive(item, depth + 1, max_depth)
+                if result and len(result) > 100:
+                    return result
+        
+        return None
+
+    def extract_transcript_from_description(self, description):
+        """
+        Extract transcript-like content from description.
+        This looks for common transcript patterns.
+        """
+        if not description:
+            return None
+        
+        # Common transcript indicators
+        transcript_indicators = [
+            r'transcript:?\s*\n(.*?)(?:\n\n|\n---|\nThanks|$)',
+            r'full transcript:?\s*\n(.*?)(?:\n\n|\n---|\nThanks|$)',
+            r'episode transcript:?\s*\n(.*?)(?:\n\n|\n---|\nThanks|$)',
+            r'show notes:?\s*\n(.*?)(?:\n\n|\n---|\nThanks|$)',
+            r'\[transcript\]\s*\n(.*?)(?:\n\n|\n---|\nThanks|$)',
+            r'--- transcript ---\s*\n(.*?)(?:\n\n|\n---|\nThanks|$)'
+        ]
+        
+        for pattern in transcript_indicators:
+            match = re.search(pattern, description, re.IGNORECASE | re.DOTALL)
+            if match:
+                transcript = match.group(1).strip()
+                return self._clean_transcript(transcript)
+        
+        # If no specific transcript section found, look for timestamp patterns
+        # This might indicate the entire description is a transcript
+        timestamp_pattern = r'\d{1,2}:\d{2}(?::\d{2})?\s+.+?(?=\d{1,2}:\d{2}|$)'
+        timestamps = re.findall(timestamp_pattern, description, re.MULTILINE | re.DOTALL)
+        
+        if len(timestamps) > 3:  # If we find multiple timestamps, likely a transcript
+            return self._clean_transcript(description)
+        
+        return None
+
+    def _clean_transcript(self, transcript):
+        """Clean up extracted transcript text."""
+        # Remove excessive whitespace
+        transcript = re.sub(r'\n\s*\n', '\n\n', transcript)
+        transcript = re.sub(r'[ \t]+', ' ', transcript)
+        
+        # Remove common non-transcript elements
+        transcript = re.sub(r'http[s]?://\S+', '', transcript)  # URLs
+        transcript = re.sub(r'#\S+', '', transcript)  # Hashtags
+        transcript = re.sub(r'@\S+', '', transcript)  # Mentions
+        
+        return transcript.strip()
+
+    def get_transcript(self, video_url_or_id, method='scraping'):
+        """
+        Main method to get transcript from video description.
+        
+        Args:
+            video_url_or_id (str): YouTube URL or video ID
+            method (str): 'scraping' or 'api'
+        
+        Returns:
+            dict: Contains 'video_id', 'description', and 'transcript'
+        """
+        video_id = self.extract_video_id(video_url_or_id)
+        if not video_id:
+            raise ValueError("Could not extract video ID from URL")
+        
+        # Get description
+        if method == 'api':
+            description = self.get_description_via_api(video_id)
+        else:
+            description = self.get_description_via_scraping(video_id)
+        
+        # Extract transcript
+        transcript = self.extract_transcript_from_description(description)
+        
+        return {
+            'video_id': video_id,
+            'description': description,
+            'transcript': transcript
+        }
+
+def save_content(content, filename):
+    """Save content to file."""
+    with open(filename, 'w', encoding='utf-8') as f:
+        f.write(content)
+    print(f"Content saved to: {filename}")
+
+def main():
+    """Main function with user input interface."""
+    import os
+    
+    # Set output directory
+    output_dir = r"C:\Users\Umut Akti\Desktop\YOUTUBE TRANSCRIPTS"
+    
+    # Create directory if it doesn't exist
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+        print(f"Created directory: {output_dir}")
+    
+    print("="*60)
+    print("       YOUTUBE DESCRIPTION TRANSCRIPT EXTRACTOR")
+    print("="*60)
+    print()
+    
+    # Get URL from user input
+    while True:
+        url_or_id = input("Enter YouTube URL (or 'quit' to exit): ").strip()
+        
+        if url_or_id.lower() in ['quit', 'exit', 'q']:
+            print("Goodbye!")
+            return
+        
+        if not url_or_id:
+            print("Please enter a valid URL.")
+            continue
+        
+        break
+    
+    # Ask for method preference
+    print("\nChoose extraction method:")
+    print("1. Web Scraping (default)")
+    print("2. YouTube Data API (requires API key)")
+    
+    method_choice = input("Enter choice (1 or 2, default is 1): ").strip()
+    
+    method = 'scraping'
+    api_key = None
+    
+    if method_choice == '2':
+        method = 'api'
+        api_key = input("Enter your YouTube Data API key: ").strip()
+        if not api_key:
+            print("No API key provided, falling back to scraping method.")
+            method = 'scraping'
+    
+    try:
+        # Initialize extractor
+        extractor = YouTubeDescriptionExtractor(api_key=api_key)
+        
+        # Extract content
+        print(f"\nExtracting content for: {url_or_id}")
+        print("Please wait...")
+        
+        result = extractor.get_transcript(url_or_id, method=method)
+        
+        # Create filenames
+        video_id = result['video_id']
+        desc_filename = os.path.join(output_dir, f"{video_id}_description.txt")
+        transcript_filename = os.path.join(output_dir, f"{video_id}_transcript.txt")
+        
+        print(f"\n✓ Video ID: {result['video_id']}")
+        print(f"✓ Description length: {len(result['description'])} characters")
+        
+        # Always save description
+        save_content(result['description'], desc_filename)
+        
+        # Show a preview of the description
+        preview_length = 300
+        if len(result['description']) > preview_length:
+            print(f"\nDescription preview (first {preview_length} chars):")
+            print("-" * 50)
+            print(result['description'][:preview_length] + "...")
+        else:
+            print(f"\nFull description:")
+            print("-" * 50)
+            print(result['description'])
+        
+        if result['transcript']:
+            print("\n" + "="*50)
+            print("EXTRACTED TRANSCRIPT")
+            print("="*50)
+            print(result['transcript'][:500] + "..." if len(result['transcript']) > 500 else result['transcript'])
+            
+            # Save transcript
+            save_content(result['transcript'], transcript_filename)
+            print(f"✓ Transcript saved to: {transcript_filename}")
+        else:
+            print("\n⚠ No transcript found in description.")
+            print("The description might not contain a transcript, or it might be in a format not recognized by this script.")
+            print("Check the full description file to see if there's transcript content in a different format.")
+        
+        # Ask if user wants to see the full description
+        if result['transcript']:
+            show_desc = input("\nWould you like to see the full description? (y/n): ").strip().lower()
+            if show_desc in ['y', 'yes']:
+                print("\n" + "="*50)
+                print("FULL DESCRIPTION")
+                print("="*50)
+                print(result['description'])
+        
+        print(f"\n✓ All files saved to: {output_dir}")
+        
+        # Ask if user wants to process another video
+        print("\n" + "-"*50)
+        another = input("Process another video? (y/n): ").strip().lower()
+        if another in ['y', 'yes']:
+            main()  # Recursive call to process another video
+    
+    except Exception as e:
+        print(f"\n❌ Error: {str(e)}")
+        print("\nTrying again...")
+        main()  # Try again on error
+
+if __name__ == "__main__":
+    main()
